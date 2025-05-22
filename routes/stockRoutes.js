@@ -2,6 +2,10 @@ const express = require("express");
 const router = express.Router();
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
+const auth = require('../middleware/auth');
+
+// Bảo vệ tất cả các route tồn kho bằng JWT
+router.use(auth);
 
 // API: GET tồn kho hiện tại
 router.get("/", async (req, res) => {

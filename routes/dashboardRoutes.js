@@ -5,6 +5,10 @@ const Customer = require("../models/Customer");
 const Product = require("../models/Product");
 const Payment = require("../models/Payment");
 const StockMovement = require("../models/StockMovement");
+const auth = require('../middleware/auth');
+
+// Protect all dashboard routes with JWT
+router.use(auth);
 
 // GET dashboard statistics
 router.get("/stats", async (req, res) => {

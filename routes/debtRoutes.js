@@ -5,6 +5,10 @@ const router = express.Router();
 const Order = require("../models/Order");
 const Payment = require("../models/Payment");
 const Customer = require("../models/Customer");
+const auth = require("../middleware/auth");
+
+// Protect all routes with JWT authentication
+router.use(auth);
 
 // Get debt summary for all customers
 router.get("/customer-debts", async (req, res) => {

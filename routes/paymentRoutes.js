@@ -4,6 +4,10 @@ const Payment = require("../models/Payment");
 const Customer = require("../models/Customer");
 const Order = require("../models/Order"); // Add Order model
 const mongoose = require("mongoose");
+const auth = require('../middleware/auth');
+
+// Bảo vệ tất cả các route thanh toán bằng JWT
+router.use(auth);
 
 // Lấy tất cả giao dịch công nợ
 router.get("/", async (req, res) => {

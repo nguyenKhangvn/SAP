@@ -1,6 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const Product = require("../models/Product");
+const auth = require("../middleware/auth");
+
+// Bảo vệ tất cả các route sản phẩm bằng JWT
+router.use(auth);
 
 // Lấy danh sách tất cả sản phẩm
 router.get("/", async (req, res) => {

@@ -6,6 +6,9 @@ const StockMovement = require("../models/StockMovement");
 const Payment = require("../models/Payment");
 const Customer = require("../models/Customer");
 const Product = require("../models/Product"); // Add Product model
+const auth = require('../middleware/auth');
+
+router.use(auth);
 
 router.post("/", async (req, res) => {
   const session = await Order.startSession();

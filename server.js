@@ -29,6 +29,8 @@ app.use("/api/dashboard", dashboardRoutes);
 const debtRoutes = require("./routes/debtRoutes");
 app.use("/api/debts", debtRoutes);
 
+const userRoutes = require("./routes/userRoutes");
+app.use("/api/users", userRoutes);
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
