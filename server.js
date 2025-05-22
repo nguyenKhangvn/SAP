@@ -32,6 +32,9 @@ app.use("/api/debts", debtRoutes);
 const userRoutes = require("./routes/userRoutes");
 app.use("/api/users", userRoutes);
 
+app.get('/healthcheck', (req, res) => {
+  res.status(200).send('OK');
+});
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
