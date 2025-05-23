@@ -5,7 +5,8 @@ const OrderDetailSchema = new mongoose.Schema({
   productCode: { type: String, required: true },
   quantity: Number,
   price: Number,
-  amount: Number
+  amount: Number,
+  profit: Number,
 });
 
 module.exports = mongoose.model("OrderDetail", OrderDetailSchema);

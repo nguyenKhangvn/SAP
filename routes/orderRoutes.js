@@ -56,14 +56,21 @@ router.post("/", async (req, res) => {
 
     // Lưu từng sản phẩm chi tiết
     for (const item of items) {
+      const product = await Product.findOne({ code: item.productCode });
+      if (!product) {
+        throw new Error(`Không tìm thấy sản phẩm với mã ${item.productCode}`);
+      }
+      const costPrice = product.costPrice;
       const amount = item.quantity * item.price;
+      const profit = amount - (item.quantity * costPrice);
 
       await OrderDetail.create([{
         orderId: order._id,
         productCode: item.productCode,
         quantity: item.quantity,
         price: item.price,
-        amount
+        amount,
+        profit
       }], { session });
 
       await StockMovement.create([{
@@ -75,12 +82,12 @@ router.post("/", async (req, res) => {
       }], { session });
       
       // Cập nhật thông tin tồn kho sản phẩm
-      const product = await Product.findOne({ code: item.productCode });
-      if (product) {
-        product.oldStock = product.newStock;
-        product.exported += item.quantity;
-        product.newStock -= item.quantity;
-        await product.save({ session });
+      const productToUpdate = await Product.findOne({ code: item.productCode });
+      if (productToUpdate) {
+        productToUpdate.oldStock = productToUpdate.newStock;
+        productToUpdate.exported += item.quantity;
+        productToUpdate.newStock -= item.quantity;
+        await productToUpdate.save({ session });
       }
     }
 
@@ -108,7 +115,9 @@ router.post("/", async (req, res) => {
 //xem tất cả đơn hàng và lấy tên khách hàng
 router.get("/", async (req, res) => {
   try {
-    const order = await Order.find().populate("customerId", "name");
+    const order = await Order.find().populate("customerId", "name")
+     .sort({ date: -1 }); 
+            // const orders = await Order.find().populate("customerId", "name");  
     
     // const ordersWithDebt = [];
     //   for (const order of orders) {
@@ -223,7 +232,7 @@ router.get("/:id", async (req, res) => {
       
       // Calculate remaining debt
       remainingDebt = (order.total || 0) - totalPaid;
-    }
+    } 
     
     res.json({
       ...order.toObject(),
@@ -237,13 +246,7 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-//get all orders of a customer
-// router.get("customer/:customerId", async (req, res) => {
-//   try {
-//     const {customer}
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// })
+
+
 
 module.exports = router;
