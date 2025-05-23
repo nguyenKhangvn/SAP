@@ -231,7 +231,492 @@ router.get("/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// Chỉnh sửa đơn hàng (thêm, sửa hoặc xóa sản phẩm)
+//Chỉnh sửa đơn hàng (thêm, sửa hoặc xóa sản phẩm)
+router.put("/:id", async (req, res) => {
+  const session = await Order.startSession();
+  session.startTransaction();
+
+  try {
+    const { id } = req.params;
+    const { items, total, status } = req.body;
+
+    // Kiểm tra đơn hàng tồn tại
+    const order = await Order.findById(id).session(session);
+    if (!order) {
+      throw new Error("Không tìm thấy đơn hàng!");
+    }
+
+    // Lấy chi tiết đơn hàng hiện tại
+    const currentOrderDetails = await OrderDetail.find({ orderId: id }).session(session);
+    
+    // Lưu trữ các mã sản phẩm để so sánh
+    const existingProductCodes = currentOrderDetails.map(detail => detail.productCode);
+    const newProductCodes = items.map(item => item.productCode);
+    
+    // ✅ XỬ LÝ SẢN PHẨM BỊ XÓA
+    for (const detail of currentOrderDetails) {
+      if (!newProductCodes.includes(detail.productCode)) {
+        const product = await Product.findOne({ code: detail.productCode }).session(session);
+        if (product) {
+          // Trả lại hàng tồn kho
+          product.oldStock = product.newStock;
+          product.exported -= detail.quantity;
+          product.newStock += detail.quantity;
+          await product.save({ session });
+          
+          // Ghi chú stock movement
+          await StockMovement.create([{
+            date: new Date(),
+            productCode: detail.productCode,
+            type: "import",
+            quantity: detail.quantity,
+            note: `Trả hàng từ việc xóa sản phẩm khỏi đơn hàng ${order.orderCode}`
+          }], { session });
+        }
+        
+        // Xóa chi tiết đơn hàng
+        await OrderDetail.findByIdAndDelete(detail._id).session(session);
+      }
+    }
+    
+    // ✅ XỬ LÝ CẬP NHẬT/THÊM SẢN PHẨM
+    for (const item of items) {
+      const product = await Product.findOne({ code: item.productCode }).session(session);
+      if (!product) {
+        throw new Error(`Không tìm thấy sản phẩm với mã ${item.productCode}`);
+      }
+      
+      const costPrice = product.costPrice;
+      const amount = item.quantity * item.price;
+      const profit = amount - (item.quantity * costPrice);
+      
+      const existingDetail = await OrderDetail.findOne({ 
+        orderId: id, 
+        productCode: item.productCode 
+      }).session(session);
+      
+      if (existingDetail) {
+        // ✅ CẬP NHẬT SẢN PHẨM CŨ
+        const quantityDifference = item.quantity - existingDetail.quantity;
+        
+        if (quantityDifference !== 0) {
+          // ✅ Kiểm tra stock đủ khi tăng quantity
+          if (quantityDifference > 0 && product.newStock < quantityDifference) {
+            throw new Error(`Không đủ hàng tồn kho cho sản phẩm ${item.productCode}. Còn lại: ${product.newStock}`);
+          }
+          
+          product.oldStock = product.newStock;
+          product.exported += quantityDifference;
+          product.newStock -= quantityDifference;
+          
+          await product.save({ session });
+          
+          // Ghi chú stock movement rõ ràng
+          await StockMovement.create([{
+            date: new Date(),
+            productCode: item.productCode,
+            type: quantityDifference > 0 ? "export" : "import",
+            quantity: Math.abs(quantityDifference),
+            note: `Cập nhật số lượng đơn hàng ${order.orderCode} (${quantityDifference > 0 ? '+' : '-'}${Math.abs(quantityDifference)})`
+          }], { session });
+        }
+        
+        // Cập nhật chi tiết đơn hàng
+        existingDetail.quantity = item.quantity;
+        existingDetail.price = item.price;
+        existingDetail.amount = amount;
+        existingDetail.profit = profit;
+        await existingDetail.save({ session });
+        
+      } else {
+        // ✅ THÊM SẢN PHẨM MỚI
+        if (product.newStock < item.quantity) {
+          throw new Error(`Không đủ hàng tồn kho cho sản phẩm ${item.productCode}. Còn lại: ${product.newStock}`);
+        }
+        
+        await OrderDetail.create([{
+          orderId: id,
+          productCode: item.productCode,
+          quantity: item.quantity,
+          price: item.price,
+          amount,
+          profit
+        }], { session });
+        
+        // Cập nhật kho
+        product.oldStock = product.newStock;
+        product.exported += item.quantity;
+        product.newStock -= item.quantity;
+        
+        await product.save({ session });
+        
+        await StockMovement.create([{
+          date: new Date(),
+          productCode: item.productCode,
+          type: "export",
+          quantity: item.quantity,
+          note: `Thêm sản phẩm mới vào đơn hàng ${order.orderCode}`
+        }], { session });
+      }
+    }
+    
+    // ✅ CẬP NHẬT TRẠNG THÁI ĐỚN HÀNG
+    const oldTotal = order.total;
+    order.total = total;
+    
+    if (status === "debt") {
+      if (order.status !== "debt") {
+        // Chuyển từ paid sang debt
+        await Payment.create([{
+          date: new Date(),
+          customerId: order.customerId,
+          amount: total,
+          type: "new_debt",
+          note: `Nợ từ đơn hàng ${order.orderCode}`
+        }], { session });
+        
+        order.status = "debt";
+        order.totalIsPaid = 0;
+        order.remainingDebt = total;
+        order.isPaid = false;
+        
+      } else {
+        // ✅ CẬP NHẬT ĐỚN NỢ CŨ - Tính lại debt properly
+        const existingDebt = await Payment.findOne({ 
+          customerId: order.customerId, 
+          type: "new_debt", 
+          note: `Nợ từ đơn hàng ${order.orderCode}` 
+        }).session(session);
+        
+        if (existingDebt) {
+          existingDebt.amount = total;
+          await existingDebt.save({ session });
+        }
+        
+        // ✅ Tính lại số tiền đã trả và nợ còn lại
+        const payments = await Payment.find({
+          customerId: order.customerId,
+          $or: [
+            { note: { $regex: order.orderCode, $options: 'i' } },
+            { type: "debt_collected" }
+          ],
+          type: { $in: ["payment", "debt_collected"] }
+        }).session(session);
+        
+        const totalPaid = payments.reduce((sum, payment) => sum + (payment.amount || 0), 0);
+        
+        order.totalIsPaid = totalPaid;
+        order.remainingDebt = Math.max(0, total - totalPaid);
+        order.isPaid = order.remainingDebt === 0;
+        order.status = order.isPaid ? "paid" : "debt";
+      }
+      
+    } else {
+      // Chuyển sang paid
+      if (order.status === "debt") {
+        // Xóa debt record cũ
+        await Payment.deleteMany({
+          customerId: order.customerId,
+          type: "new_debt",
+          note: `Nợ từ đơn hàng ${order.orderCode}`
+        }).session(session);
+      }
+      
+      order.status = "paid";
+      order.totalIsPaid = total;
+      order.remainingDebt = 0;
+      order.isPaid = true;
+    }
+    
+    await order.save({ session });
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({ 
+      message: "Cập nhật đơn hàng thành công!",
+      order: {
+        orderCode: order.orderCode,
+        total: order.total,
+        status: order.status,
+        totalIsPaid: order.totalIsPaid,
+        remainingDebt: order.remainingDebt
+      }
+    });
+    
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API để xem chi tiết sản phẩm trong một đơn hàng
+router.get("/:id/products", async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Kiểm tra đơn hàng tồn tại
+    const order = await Order.findById(id).populate("customerId", "name");
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
+    
+    // Lấy chi tiết đơn hàng
+    const orderDetails = await OrderDetail.find({ orderId: id });
+    
+    // Lấy thông tin chi tiết của từng sản phẩm
+    const products = [];
+    for (const detail of orderDetails) {
+      const product = await Product.findOne({ code: detail.productCode });
+      
+      products.push({
+        orderDetailId: detail._id,
+        productCode: detail.productCode,
+        productName: product ? product.name : "Sản phẩm không tồn tại",
+        quantity: detail.quantity,
+        price: detail.price,
+        amount: detail.amount,
+        profit: detail.profit,
+      });
+    }
+    
+    res.json({
+      order: {
+        _id: order._id,
+        orderCode: order.orderCode,
+        date: order.date,
+        customer: order.customerId,
+        status: order.status,
+        total: order.total,
+        totalIsPaid: order.totalIsPaid,
+        remainingDebt: order.remainingDebt,
+        isPaid: order.isPaid
+      },
+      products
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ... (previous code)
+
+// router.put("/:id", async (req, res) => {
+//   const session = await Order.startSession();
+//   session.startTransaction();
+
+//   try {
+//     const { id } = req.params;
+//     const { items, total, status } = req.body;
+
+//     const order = await Order.findById(id).session(session);
+//     if (!order) {
+//       throw new Error("Không tìm thấy đơn hàng!");
+//     }
+
+//     const currentOrderDetails = await OrderDetail.find({ orderId: id }).session(session);
+
+//     const newProductCodes = items.map(item => item.productCode);
+
+//     // --- Step 1: Handle removed products and return to stock ---
+//     for (const detail of currentOrderDetails) {
+//       if (!newProductCodes.includes(detail.productCode)) {
+//         const product = await Product.findOne({ code: detail.productCode }).session(session);
+//         if (product) {
+//           product.oldStock = product.newStock;
+//           product.exported -= detail.quantity;
+//           product.newStock += detail.quantity;
+//           await product.save({ session });
+
+//           // Record stock movement for items returned from order
+//           await StockMovement.create([{
+//             date: new Date(),
+//             productCode: detail.productCode,
+//             type: "import", // Because it's coming back into stock
+//             quantity: detail.quantity,
+//             note: `Nhập lại từ đơn hàng ${order.orderCode} (sản phẩm đã xóa)`
+//           }], { session });
+//         }
+//         await OrderDetail.findByIdAndDelete(detail._id).session(session);
+//       }
+//     }
+
+//     // --- Step 2: Handle updated or new products ---
+//     for (const item of items) {
+//       const product = await Product.findOne({ code: item.productCode }).session(session);
+//       if (!product) {
+//         throw new Error(`Không tìm thấy sản phẩm với mã ${item.productCode}`);
+//       }
+
+//       const costPrice = product.costPrice;
+//       const amount = item.quantity * item.price;
+//       const profit = amount - (item.quantity * costPrice);
+
+//       const existingDetail = await OrderDetail.findOne({
+//         orderId: id,
+//         productCode: item.productCode
+//       }).session(session);
+
+//       if (existingDetail) {
+//         const quantityDifference = item.quantity - existingDetail.quantity;
+
+//         if (quantityDifference !== 0) {
+//           product.oldStock = product.newStock;
+
+//           if (quantityDifference > 0) {
+//             product.exported += quantityDifference;
+//             product.newStock -= quantityDifference;
+//             await StockMovement.create([{
+//               date: new Date(),
+//               productCode: item.productCode,
+//               type: "export",
+//               quantity: quantityDifference,
+//               note: `Cập nhật xuất thêm cho đơn hàng ${order.orderCode}`
+//             }], { session });
+//           } else { // quantityDifference < 0
+//             product.exported += quantityDifference; // e.g., exported decreased by 5
+//             product.newStock -= quantityDifference; // e.g., newStock increased by 5
+//             await StockMovement.create([{
+//               date: new Date(),
+//               productCode: item.productCode,
+//               type: "import",
+//               quantity: -quantityDifference, // Make quantity positive for import
+//               note: `Cập nhật nhập lại từ đơn hàng ${order.orderCode}`
+//             }], { session });
+//           }
+//           await product.save({ session });
+//         }
+
+//         existingDetail.quantity = item.quantity;
+//         existingDetail.price = item.price;
+//         existingDetail.amount = amount;
+//         existingDetail.profit = profit;
+//         await existingDetail.save({ session });
+//       } else {
+//         // New product added to order
+//         await OrderDetail.create([{
+//           orderId: id,
+//           productCode: item.productCode,
+//           quantity: item.quantity,
+//           price: item.price,
+//           amount,
+//           profit
+//         }], { session });
+
+//         product.oldStock = product.newStock;
+//         product.exported += item.quantity;
+//         product.newStock -= item.quantity;
+//         await StockMovement.create([{
+//           date: new Date(),
+//           productCode: item.productCode,
+//           type: "export",
+//           quantity: item.quantity,
+//           note: `Xuất thêm cho đơn hàng ${order.orderCode}`
+//         }], { session });
+//         await product.save({ session });
+//       }
+//     }
+
+//     // --- Step 3: Update Order and Payment Status ---
+//     order.total = total;
+
+//     if (status === "debt") {
+//       // If the order was fully paid before, or if it's a new debt
+//       if (order.status !== "debt") {
+//         await Payment.create([{
+//           date: new Date(),
+//           customerId: order.customerId,
+//           amount: total,
+//           type: "new_debt",
+//           note: `Nợ từ đơn hàng ${order.orderCode}`
+//         }], { session });
+
+//         order.status = "debt";
+//         order.totalIsPaid = 0; // No payments made yet towards this new debt
+//         order.remainingDebt = total;
+//         order.isPaid = false;
+//       } else {
+//         // It was already a debt order, update the original debt amount if exists
+//         const existingNewDebtPayment = await Payment.findOne({
+//           customerId: order.customerId,
+//           type: "new_debt",
+//           note: `Nợ từ đơn hàng ${order.orderCode}`
+//         }).session(session);
+
+//         if (existingNewDebtPayment) {
+//           existingNewDebtPayment.amount = total;
+//           await existingNewDebtPayment.save({ session });
+//         } else {
+//             // This case might happen if the original "new_debt" payment was manually removed,
+//             // or if the order somehow became 'debt' without a corresponding 'new_debt' payment.
+//             // Create one to ensure consistency.
+//              await Payment.create([{
+//                 date: new Date(),
+//                 customerId: order.customerId,
+//                 amount: total,
+//                 type: "new_debt",
+//                 note: `Nợ từ đơn hàng ${order.orderCode}`
+//             }], { session });
+//         }
+
+//         // Recalculate paid amount and remaining debt for existing debt orders
+//         const payments = await Payment.find({
+//           customerId: order.customerId,
+//           $or: [
+//             { note: { $regex: order.orderCode, $options: 'i' } }, // Payments specifically for this order's debt
+//             { type: "debt_collected" } // General debt collections from this customer
+//           ]
+//         }).session(session);
+
+//         let totalPaidForThisOrder = 0;
+//         for (const payment of payments) {
+//             // Be careful to only count payments directly related to this order's debt,
+//             // or general debt collected that implicitly reduces this order's debt.
+//             // This logic can be tricky if payments are not explicitly linked to specific orders.
+//             // For simplicity, we assume payments with order code in note are direct.
+//             if (payment.type === "payment" || payment.type === "debt_collected" || payment.note.includes(order.orderCode)) {
+//                 totalPaidForThisOrder += payment.amount || 0;
+//             }
+//         }
+        
+//         // Ensure totalPaid does not exceed total order value
+//         order.totalIsPaid = Math.min(totalPaidForThisOrder, total);
+//         order.remainingDebt = Math.max(0, total - totalPaidForThisOrder);
+//         order.isPaid = order.remainingDebt <= 0;
+//       }
+//     } else { // status === "paid"
+//       if (order.status === "debt") {
+//         // If it was a debt order, delete the initial "new_debt" record
+//         await Payment.deleteMany({
+//           customerId: order.customerId,
+//           type: "new_debt",
+//           note: `Nợ từ đơn hàng ${order.orderCode}`
+//         }).session(session);
+
+//         // Also, any direct payments collected for this specific order debt should be reviewed.
+//         // If "debt_collected" payments are not linked to specific orders, this might need more complex logic.
+//         // For now, only deleting the 'new_debt' record.
+//       }
+
+//       order.status = "paid";
+//       order.totalIsPaid = total;
+//       order.remainingDebt = 0;
+//       order.isPaid = true;
+//     }
+
+//     await order.save({ session });
+//     await session.commitTransaction();
+//     session.endSession();
+
+//     res.json({ message: "Cập nhật đơn hàng thành công!" });
+//   } catch (err) {
+//     await session.abortTransaction();
+//     session.endSession();
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+// ... (remaining code)
 // router.put("/:id", async (req, res) => {
 //   const session = await Order.startSession();
 //   session.startTransaction();
@@ -394,24 +879,26 @@ router.get("/:id", async (req, res) => {
 //         }
         
 //         // Tính toán lại số tiền đã trả và số nợ còn lại
-//         // const payments = await Payment.find({
-//         //   customerId: order.customerId,
-//         //   $or: [
-//         //     { note: { $regex: order.orderCode, $options: 'i' } },
-//         //     { type: "debt_collected" }
-//         //   ]
-//         // }).session(session);
+//         const payments = await Payment.find({
+//           customerId: order.customerId,
+//           $or: [
+//             { note: { $regex: order.orderCode, $options: 'i' } },
+//             { type: "debt_collected" }
+//           ]
+//         }).session(session);
         
-//         // const totalPaid = payments.reduce((sum, payment) => {
-//         //   if (payment.type === "payment" || payment.type === "debt_collected") {
-//         //     return sum + (payment.amount || 0);
-//         //   }
-//         //   return sum;
-//         // }, 0);
+//         const totalPaid = payments.reduce((sum, payment) => {
+//           if (payment.type === "payment" || payment.type === "debt_collected") {
+//             return sum + (payment.amount || 0);
+//           }
+//           return sum;
+//         }, 0);
         
-//         order.totalIsPaid = 0;
-//         order.remainingDebt = 0;
-//         order.isPaid = false;
+//         const remainingDebt = total - totalPaid;
+        
+//         order.totalIsPaid = totalPaid > total ? total : totalPaid;
+//         order.remainingDebt = remainingDebt > 0 ? remainingDebt : 0;
+//         order.isPaid = remainingDebt <= 0;
 //       }
 //     } else {
 //       // Nếu chuyển thành đơn trả tiền đầy đủ
@@ -442,272 +929,5 @@ router.get("/:id", async (req, res) => {
 //   }
 // });
 
-// API để xem chi tiết sản phẩm trong một đơn hàng
-router.get("/:id/products", async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Kiểm tra đơn hàng tồn tại
-    const order = await Order.findById(id).populate("customerId", "name");
-    if (!order) {
-      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
-    }
-    
-    // Lấy chi tiết đơn hàng
-    const orderDetails = await OrderDetail.find({ orderId: id });
-    
-    // Lấy thông tin chi tiết của từng sản phẩm
-    const products = [];
-    for (const detail of orderDetails) {
-      const product = await Product.findOne({ code: detail.productCode });
-      
-      products.push({
-        orderDetailId: detail._id,
-        productCode: detail.productCode,
-        productName: product ? product.name : "Sản phẩm không tồn tại",
-        quantity: detail.quantity,
-        price: detail.price,
-        amount: detail.amount,
-        profit: detail.profit,
-      });
-    }
-    
-    res.json({
-      order: {
-        _id: order._id,
-        orderCode: order.orderCode,
-        date: order.date,
-        customer: order.customerId,
-        status: order.status,
-        total: order.total,
-        totalIsPaid: order.totalIsPaid,
-        remainingDebt: order.remainingDebt,
-        isPaid: order.isPaid
-      },
-      products
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ... (previous code)
-
-router.put("/:id", async (req, res) => {
-  const session = await Order.startSession();
-  session.startTransaction();
-
-  try {
-    const { id } = req.params;
-    const { items, total, status } = req.body;
-
-    const order = await Order.findById(id).session(session);
-    if (!order) {
-      throw new Error("Không tìm thấy đơn hàng!");
-    }
-
-    const currentOrderDetails = await OrderDetail.find({ orderId: id }).session(session);
-
-    const newProductCodes = items.map(item => item.productCode);
-
-    // --- Step 1: Handle removed products and return to stock ---
-    for (const detail of currentOrderDetails) {
-      if (!newProductCodes.includes(detail.productCode)) {
-        const product = await Product.findOne({ code: detail.productCode }).session(session);
-        if (product) {
-          product.oldStock = product.newStock;
-          product.exported -= detail.quantity;
-          product.newStock += detail.quantity;
-          await product.save({ session });
-
-          // Record stock movement for items returned from order
-          await StockMovement.create([{
-            date: new Date(),
-            productCode: detail.productCode,
-            type: "import", // Because it's coming back into stock
-            quantity: detail.quantity,
-            note: `Nhập lại từ đơn hàng ${order.orderCode} (sản phẩm đã xóa)`
-          }], { session });
-        }
-        await OrderDetail.findByIdAndDelete(detail._id).session(session);
-      }
-    }
-
-    // --- Step 2: Handle updated or new products ---
-    for (const item of items) {
-      const product = await Product.findOne({ code: item.productCode }).session(session);
-      if (!product) {
-        throw new Error(`Không tìm thấy sản phẩm với mã ${item.productCode}`);
-      }
-
-      const costPrice = product.costPrice;
-      const amount = item.quantity * item.price;
-      const profit = amount - (item.quantity * costPrice);
-
-      const existingDetail = await OrderDetail.findOne({
-        orderId: id,
-        productCode: item.productCode
-      }).session(session);
-
-      if (existingDetail) {
-        const quantityDifference = item.quantity - existingDetail.quantity;
-
-        if (quantityDifference !== 0) {
-          product.oldStock = product.newStock;
-
-          if (quantityDifference > 0) {
-            product.exported += quantityDifference;
-            product.newStock -= quantityDifference;
-            await StockMovement.create([{
-              date: new Date(),
-              productCode: item.productCode,
-              type: "export",
-              quantity: quantityDifference,
-              note: `Cập nhật xuất thêm cho đơn hàng ${order.orderCode}`
-            }], { session });
-          } else { // quantityDifference < 0
-            product.exported += quantityDifference; // e.g., exported decreased by 5
-            product.newStock -= quantityDifference; // e.g., newStock increased by 5
-            await StockMovement.create([{
-              date: new Date(),
-              productCode: item.productCode,
-              type: "import",
-              quantity: -quantityDifference, // Make quantity positive for import
-              note: `Cập nhật nhập lại từ đơn hàng ${order.orderCode}`
-            }], { session });
-          }
-          await product.save({ session });
-        }
-
-        existingDetail.quantity = item.quantity;
-        existingDetail.price = item.price;
-        existingDetail.amount = amount;
-        existingDetail.profit = profit;
-        await existingDetail.save({ session });
-      } else {
-        // New product added to order
-        await OrderDetail.create([{
-          orderId: id,
-          productCode: item.productCode,
-          quantity: item.quantity,
-          price: item.price,
-          amount,
-          profit
-        }], { session });
-
-        product.oldStock = product.newStock;
-        product.exported += item.quantity;
-        product.newStock -= item.quantity;
-        await StockMovement.create([{
-          date: new Date(),
-          productCode: item.productCode,
-          type: "export",
-          quantity: item.quantity,
-          note: `Xuất thêm cho đơn hàng ${order.orderCode}`
-        }], { session });
-        await product.save({ session });
-      }
-    }
-
-    // --- Step 3: Update Order and Payment Status ---
-    order.total = total;
-
-    if (status === "debt") {
-      // If the order was fully paid before, or if it's a new debt
-      if (order.status !== "debt") {
-        await Payment.create([{
-          date: new Date(),
-          customerId: order.customerId,
-          amount: total,
-          type: "new_debt",
-          note: `Nợ từ đơn hàng ${order.orderCode}`
-        }], { session });
-
-        order.status = "debt";
-        order.totalIsPaid = 0; // No payments made yet towards this new debt
-        order.remainingDebt = total;
-        order.isPaid = false;
-      } else {
-        // It was already a debt order, update the original debt amount if exists
-        const existingNewDebtPayment = await Payment.findOne({
-          customerId: order.customerId,
-          type: "new_debt",
-          note: `Nợ từ đơn hàng ${order.orderCode}`
-        }).session(session);
-
-        if (existingNewDebtPayment) {
-          existingNewDebtPayment.amount = total;
-          await existingNewDebtPayment.save({ session });
-        } else {
-            // This case might happen if the original "new_debt" payment was manually removed,
-            // or if the order somehow became 'debt' without a corresponding 'new_debt' payment.
-            // Create one to ensure consistency.
-             await Payment.create([{
-                date: new Date(),
-                customerId: order.customerId,
-                amount: total,
-                type: "new_debt",
-                note: `Nợ từ đơn hàng ${order.orderCode}`
-            }], { session });
-        }
-
-        // Recalculate paid amount and remaining debt for existing debt orders
-        const payments = await Payment.find({
-          customerId: order.customerId,
-          $or: [
-            { note: { $regex: order.orderCode, $options: 'i' } }, // Payments specifically for this order's debt
-            { type: "debt_collected" } // General debt collections from this customer
-          ]
-        }).session(session);
-
-        let totalPaidForThisOrder = 0;
-        for (const payment of payments) {
-            // Be careful to only count payments directly related to this order's debt,
-            // or general debt collected that implicitly reduces this order's debt.
-            // This logic can be tricky if payments are not explicitly linked to specific orders.
-            // For simplicity, we assume payments with order code in note are direct.
-            if (payment.type === "payment" || payment.type === "debt_collected" || payment.note.includes(order.orderCode)) {
-                totalPaidForThisOrder += payment.amount || 0;
-            }
-        }
-        
-        // Ensure totalPaid does not exceed total order value
-        order.totalIsPaid = Math.min(totalPaidForThisOrder, total);
-        order.remainingDebt = Math.max(0, total - totalPaidForThisOrder);
-        order.isPaid = order.remainingDebt <= 0;
-      }
-    } else { // status === "paid"
-      if (order.status === "debt") {
-        // If it was a debt order, delete the initial "new_debt" record
-        await Payment.deleteMany({
-          customerId: order.customerId,
-          type: "new_debt",
-          note: `Nợ từ đơn hàng ${order.orderCode}`
-        }).session(session);
-
-        // Also, any direct payments collected for this specific order debt should be reviewed.
-        // If "debt_collected" payments are not linked to specific orders, this might need more complex logic.
-        // For now, only deleting the 'new_debt' record.
-      }
-
-      order.status = "paid";
-      order.totalIsPaid = total;
-      order.remainingDebt = 0;
-      order.isPaid = true;
-    }
-
-    await order.save({ session });
-    await session.commitTransaction();
-    session.endSession();
-
-    res.json({ message: "Cập nhật đơn hàng thành công!" });
-  } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ... (remaining code)
 
 module.exports = router;
